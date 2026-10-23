@@ -1,0 +1,53 @@
+# Shopify app configuration for the EXISTING V3PL public app (Dev Dashboard).
+# This file is the source of truth for app-specific webhook subscriptions (D-025).
+# It does not create an app: client_id identifies the app that already exists.
+#
+# Apply with Shopify CLI (creates a new app version from this file):
+#   npx @shopify/cli@latest app deploy --no-release --message "webhook subscriptions"
+#   → review the new version in the Dev Dashboard → Release
+# Everything here is public configuration; there are no secrets in this file.
+
+client_id = "34d04804ad01d1d2b3d4b2bd3fcdaae7"
+name = "V3PLMXVS Platform"
+application_url = "https://v3pl.vercel.app/admin/settings/shopify"
+embedded = false
+
+[build]
+automatically_update_urls_on_dev = false
+dev_store_url = "shakilxvs.myshopify.com"
+
+[access_scopes]
+# Minimum scopes (D-023). Must equal SHOPIFY_SCOPES in the server environment.
+# write_orders added 2026-09-15 (D-062): manual V3PL orders are created in the mapped store via orderCreate.
+# A new app version + release is required, and every connected store must be reconnected (re-authorised)
+# before ORDER_CREATE jobs can run; the runner refuses stores whose granted scopes lack write_orders.
+# read_customers added 2026-09-22 (D-065): "Sync customers" reads the store's customers (name, e-mail, phone,
+# default address) into the V3PL customer directory and links imported orders to them. Same procedure: new
+# app version + release, then Reconnect every store; the sync refuses stores whose granted scopes lack it.
+scopes = "read_orders,write_orders,write_merchant_managed_fulfillment_orders,read_fulfillments,read_products,write_inventory,read_locations,read_customers"
+
+[auth]
+redirect_urls = ["https://v3pl.vercel.app/api/shopify/oauth/callback"]
+
+[webhooks]
+api_version = "2026-07"
+
+# Order lifecycle (Step 3 handlers)
+[[webhooks.subscriptions]]
+topics = ["orders/create", "orders/updated", "orders/edited", "orders/cancelled", "refunds/create"]
+uri = "https://v3pl.vercel.app/api/webhooks/shopify"
+
+# Fulfilment / tracking changes made in Shopify Admin (Step 3 handlers)
+[[webhooks.subscriptions]]
+topics = ["fulfillments/create", "fulfillments/update"]
+uri = "https://v3pl.vercel.app/api/webhooks/shopify"
+
+# Catalog changes (Step 2 handler) and app removal (Step 1 handler)
+[[webhooks.subscriptions]]
+topics = ["products/update", "app/uninstalled"]
+uri = "https://v3pl.vercel.app/api/webhooks/shopify"
+
+# Mandatory privacy topics for public apps (Step 1 handler: acknowledge + flag for manual action)
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "https://v3pl.vercel.app/api/webhooks/shopify/compliance"

@@ -1,0 +1,1403 @@
+// V3PL — core Prisma schema
+// Ownership: core session (D-027). Shopify models are added by the Shopify session
+// in their own migration and must not be placed in this file's core sections.
+//
+// Phase 1: User + AuditLog foundation.
+// Phase 2: Owner (vendors / 3PL clients) + User.ownerId + soft-delete status.
+// Phase 3: products, variants, images, warehouses, locations, inventory ledger,
+//          receiving, transfers.
+// Phase 4: orders (multi-owner lines), fulfillments, shipments, returns, order
+//          history, CSV import/export jobs.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Ownership (D-003): one table for vendors and 3PL clients.
+// Every product/SKU (Phase 3) will carry a NOT NULL ownerId → exactly one owner.
+// ---------------------------------------------------------------------------
+
+enum OwnerType {
+  VENDOR
+  THREEPL_CLIENT
+}
+
+/// Owners are never hard-deleted (they will own inventory history); INACTIVE hides
+/// them from day-to-day screens and blocks new activity.
+enum OwnerStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Owner {
+  id           String      @id @default(cuid())
+  type         OwnerType
+  /// Short human code used in imports/exports and reports, e.g. "ACME" or "VEN-014".
+  code         String      @unique
+  businessName String
+  contactName  String?
+  email        String?
+  phone        String?
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String?
+  notes        String?
+  status       OwnerStatus @default(ACTIVE)
+  /// Operational charges are applied to this owner's shipments only when enabled (NR-8, D-063).
+  chargesEnabled Boolean   @default(false)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  users                 User[]
+  chargeRules           ChargeRule[]
+  charges               Charge[]
+  ledgerEntries         LedgerEntry[]
+  products              Product[]
+  receivingRecords      ReceivingRecord[]
+  inventoryTransactions InventoryTransaction[]
+  orderItems            OrderItem[]
+  returnItems           ReturnItem[]
+  submittedOrders       Order[]                @relation("OrderSubmittedByOwner")
+  customers             Customer[]
+
+  @@index([type, status])
+  @@index([businessName])
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// Platform roles (D-010). Staff roles sign in at /admin; portal roles at /user.
+enum UserRole {
+  ADMIN
+  WAREHOUSE
+  SALES
+  VENDOR
+  THREEPL_CLIENT
+}
+
+/// A user must be ACTIVE to hold a session. Status is checked on every request.
+/// DELETED is terminal (D-037): the row is kept for audit/ledger integrity, the
+/// Firebase account is removed and the e-mail is tombstoned so it can be reused.
+enum UserStatus {
+  ACTIVE
+  DISABLED
+  BANNED
+  DELETED
+}
+
+model User {
+  id           String     @id @default(cuid())
+  /// Firebase Authentication UID — the only link between Firebase and this row.
+  firebaseUid  String     @unique
+  email        String     @unique
+  name         String
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+  /// Required for VENDOR / THREEPL_CLIENT, must be NULL for staff.
+  /// Enforced by CHECK constraint "User_owner_role_check" (migration 20260904_phase2_owners).
+  ownerId      String?
+  owner        Owner?     @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  phone        String?
+  notes        String?
+  lastLoginAt  DateTime?
+  deletedAt    DateTime?
+  /// Original e-mail preserved when the row is tombstoned on delete.
+  deletedEmail String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  auditLogs             AuditLog[]
+  inventoryTransactions InventoryTransaction[]
+  receivingRecords      ReceivingRecord[]
+  transfersCreated      Transfer[]             @relation("TransferCreatedBy")
+  transfersCompleted    Transfer[]             @relation("TransferCompletedBy")
+  ordersCreated         Order[]                @relation("OrderCreatedBy")
+  fulfillmentsCreated   Fulfillment[]          @relation("FulfillmentCreatedBy")
+  fulfillmentsAssigned  Fulfillment[]          @relation("FulfillmentAssignedTo")
+  shipmentsCreated      Shipment[]
+  returnsReceived       Return[]               @relation("ReturnReceivedBy")
+  returnsInspected      Return[]               @relation("ReturnInspectedBy")
+  orderEvents           OrderEvent[]
+  importJobs            ImportJob[]
+
+  @@index([role, status])
+  @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------------
+// Audit (append-only; no update/delete paths in application code)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// Dotted action key, e.g. "user.created", "inventory.adjusted"
+  action     String
+  /// Entity type name, e.g. "User", "Order"
+  entityType String
+  entityId   String?
+  oldValues  Json?
+  newValues  Json?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (Phase 3). Every product belongs to exactly one owner (D-003/D-004/D-005).
+// SKU, price and all stock live on the variant; single-variant products have one
+// default variant.
+// ---------------------------------------------------------------------------
+
+enum ProductStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Product {
+  id          String        @id @default(cuid())
+  ownerId     String
+  owner       Owner         @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  name        String
+  category    String?
+  description String?
+  status      ProductStatus @default(ACTIVE)
+  notes       String?
+  /// Shopify-style option names (max 3, e.g. ["Color", "Size"]); empty for a simple product (D-053).
+  options     String[]      @default([])
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  variants ProductVariant[]
+  images   ProductImage[]
+
+  @@index([ownerId, status])
+  @@index([name])
+}
+
+model ProductVariant {
+  id             String        @id @default(cuid())
+  productId      String
+  product        Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+  /// Globally unique internal SKU (D-004). Uppercase, trimmed.
+  sku            String        @unique
+  /// Variant label derived from optionValues ("Black / Small"). Null for the default variant of a simple product.
+  name           String?
+  /// One value per product option, same order as Product.options (D-053).
+  optionValues   String[]      @default([])
+  /// Optional variant barcode (EAN/UPC/GTIN or internal). Globally unique like the SKU; NULL = none (D-059).
+  barcode        String?       @unique
+  /// Retail price: default unit price on customer orders (D-057).
+  price          Decimal?      @db.Decimal(12, 2)
+  /// Wholesale price: owner/business valuation and later due/owe calculations (D-057).
+  wholesalePrice Decimal?      @db.Decimal(12, 2)
+  cost           Decimal?      @db.Decimal(12, 2)
+  currency       String        @default("USD")
+  /// Optional physical data (D-057): weight in grams, dimensions in centimetres.
+  weightGrams    Int?
+  lengthCm       Decimal?      @db.Decimal(8, 2)
+  widthCm        Decimal?      @db.Decimal(8, 2)
+  heightCm       Decimal?      @db.Decimal(8, 2)
+  status         ProductStatus @default(ACTIVE)
+  isDefault      Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  images          ProductImage[]
+  balances        InventoryBalance[]
+  levels          InventoryLevel[]
+  transactions    InventoryTransaction[]
+  receivingItems  ReceivingItem[]
+  transferItems   TransferItem[]
+  orderItems      OrderItem[]
+  returnItems     ReturnItem[]
+  shopifyMappings ShopifyVariantMapping[]
+
+  @@index([productId])
+}
+
+/// Cloudinary references only — never binaries (spec §13).
+model ProductImage {
+  id                 String          @id @default(cuid())
+  productId          String
+  product            Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId          String?
+  variant            ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  cloudinaryPublicId String          @unique
+  url                String
+  width              Int?
+  height             Int?
+  position           Int             @default(0)
+  alt                String?
+  createdAt          DateTime        @default(now())
+
+  @@index([productId, position])
+}
+
+// ---------------------------------------------------------------------------
+// Warehouses & locations (D-019: flat location table; D-043: a location is always
+// known — every warehouse has a default "MAIN" location).
+// ---------------------------------------------------------------------------
+
+enum WarehouseStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Warehouse {
+  id           String          @id @default(cuid())
+  code         String          @unique
+  name         String
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String?
+  notes        String?
+  status       WarehouseStatus @default(ACTIVE)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  locations        Location[]
+  balances         InventoryBalance[]
+  levels           InventoryLevel[]
+  transactions     InventoryTransaction[]
+  receivingRecords ReceivingRecord[]
+  transfersOut     Transfer[]              @relation("TransferSource")
+  transfersIn      Transfer[]              @relation("TransferDestination")
+  orders           Order[]
+  orderItems       OrderItem[]
+  fulfillments     Fulfillment[]
+  returns          Return[]
+  shopifyStores    ShopifyStoreWarehouse[]
+
+  @@index([status])
+}
+
+model Location {
+  id          String    @id @default(cuid())
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  /// Human label, unique per warehouse, e.g. "MAIN" or "A-01-3-B2".
+  label       String
+  zone        String?
+  rack        String?
+  shelf       String?
+  bin         String?
+  isDefault   Boolean   @default(false)
+  isActive    Boolean   @default(true)
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  levels              InventoryLevel[]
+  transactions        InventoryTransaction[]
+  receivingItems      ReceivingItem[]
+  transferItemsSource TransferItem[]         @relation("TransferItemSourceLocation")
+  transferItemsDest   TransferItem[]         @relation("TransferItemDestLocation")
+  fulfillmentItems    FulfillmentItem[]
+  returnItems         ReturnItem[]
+
+  @@unique([warehouseId, label])
+  @@index([warehouseId, isActive])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory engine (D-006/D-007/D-043)
+// InventoryBalance  = variant × warehouse cache: onHand, reserved (concurrency anchor)
+// InventoryLevel    = variant × warehouse × location: onHand (physical placement)
+// InventoryTransaction = append-only ledger; the authoritative history.
+// Invariant (service-enforced, same transaction): balance.onHand = Σ levels.onHand.
+// CHECK constraints (hand-written in migration): onHand ≥ 0, reserved ≥ 0, reserved ≤ onHand.
+// ---------------------------------------------------------------------------
+
+model InventoryBalance {
+  id          String         @id @default(cuid())
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  warehouseId String
+  warehouse   Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  onHand      Int            @default(0)
+  reserved    Int            @default(0)
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([variantId, warehouseId])
+  @@index([warehouseId])
+}
+
+model InventoryLevel {
+  id          String         @id @default(cuid())
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  warehouseId String
+  warehouse   Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  locationId  String
+  location    Location       @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  onHand      Int            @default(0)
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([variantId, warehouseId, locationId])
+  @@index([warehouseId, locationId])
+}
+
+enum InventoryTransactionType {
+  RECEIVE
+  RESERVE
+  RELEASE
+  SHIP
+  TRANSFER_OUT
+  TRANSFER_IN
+  MOVE
+  RETURN
+  DAMAGE
+  MISSING
+  ADJUSTMENT
+}
+
+/// Which cached figure the row changed. ON_HAND rows carry a location; RESERVED rows do not.
+enum InventoryBucket {
+  ON_HAND
+  RESERVED
+}
+
+model InventoryTransaction {
+  id              String                   @id @default(cuid())
+  variantId       String
+  variant         ProductVariant           @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  /// Denormalised from the variant's product at write time (owner history stays stable).
+  ownerId         String
+  owner           Owner                    @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  warehouseId     String
+  warehouse       Warehouse                @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  locationId      String?
+  location        Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  type            InventoryTransactionType
+  bucket          InventoryBucket
+  /// Signed change applied to the bucket (+ receive, − ship, …).
+  quantity        Int
+  /// Bucket value before/after at the row's granularity (location level for ON_HAND, warehouse for RESERVED).
+  beforeQty       Int
+  afterQty        Int
+  reason          String?
+  notes           String?
+  userId          String
+  user            User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  receivingId     String?
+  receiving       ReceivingRecord?         @relation(fields: [receivingId], references: [id], onDelete: Restrict)
+  transferId      String?
+  transfer        Transfer?                @relation(fields: [transferId], references: [id], onDelete: Restrict)
+  orderId         String?
+  orderItemId     String?
+  shipmentId      String?
+  /// External integration event id (e.g. Shopify webhook eventId) — idempotency trail (D-013).
+  externalEventId String?
+  createdAt       DateTime                 @default(now())
+  order           Order?                   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem       OrderItem?               @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  shipment        Shipment?                @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+
+  @@index([variantId, createdAt])
+  @@index([ownerId, createdAt])
+  @@index([warehouseId, createdAt])
+  @@index([type, createdAt])
+  @@index([orderId])
+  @@index([externalEventId])
+}
+
+// ---------------------------------------------------------------------------
+// Receiving (spec §16) — posted immediately; generates RECEIVE ledger rows.
+// ---------------------------------------------------------------------------
+
+model ReceivingRecord {
+  id          String    @id @default(cuid())
+  /// Human reference, e.g. supplier delivery note / PO number. Optional, not unique.
+  reference   String?
+  ownerId     String
+  owner       Owner     @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  receivedAt  DateTime  @default(now())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  notes       String?
+  createdAt   DateTime  @default(now())
+
+  items        ReceivingItem[]
+  transactions InventoryTransaction[]
+
+  @@index([ownerId, receivedAt])
+  @@index([warehouseId, receivedAt])
+}
+
+model ReceivingItem {
+  id          String          @id @default(cuid())
+  receivingId String
+  receiving   ReceivingRecord @relation(fields: [receivingId], references: [id], onDelete: Cascade)
+  variantId   String
+  variant     ProductVariant  @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  locationId  String
+  location    Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  quantity    Int
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([receivingId])
+  @@index([variantId])
+}
+
+// ---------------------------------------------------------------------------
+// Transfers between warehouses (spec §18). Creating a transfer moves stock out of
+// the source at once (TRANSFER_OUT, in transit); completing it books it into the
+// destination (TRANSFER_IN); cancelling returns it to the source.
+// ---------------------------------------------------------------------------
+
+enum TransferStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+model Transfer {
+  id                String         @id @default(cuid())
+  reference         String?
+  sourceWarehouseId String
+  sourceWarehouse   Warehouse      @relation("TransferSource", fields: [sourceWarehouseId], references: [id], onDelete: Restrict)
+  destWarehouseId   String
+  destWarehouse     Warehouse      @relation("TransferDestination", fields: [destWarehouseId], references: [id], onDelete: Restrict)
+  status            TransferStatus @default(PENDING)
+  notes             String?
+  createdById       String
+  createdBy         User           @relation("TransferCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  completedById     String?
+  completedBy       User?          @relation("TransferCompletedBy", fields: [completedById], references: [id], onDelete: Restrict)
+  createdAt         DateTime       @default(now())
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+
+  items        TransferItem[]
+  transactions InventoryTransaction[]
+
+  @@index([status, createdAt])
+  @@index([sourceWarehouseId])
+  @@index([destWarehouseId])
+}
+
+model TransferItem {
+  id               String         @id @default(cuid())
+  transferId       String
+  transfer         Transfer       @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variantId        String
+  variant          ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  quantity         Int
+  sourceLocationId String
+  sourceLocation   Location       @relation("TransferItemSourceLocation", fields: [sourceLocationId], references: [id], onDelete: Restrict)
+  /// Chosen at completion; null while in transit.
+  destLocationId   String?
+  destLocation     Location?      @relation("TransferItemDestLocation", fields: [destLocationId], references: [id], onDelete: Restrict)
+
+  @@index([transferId])
+  @@index([variantId])
+}
+
+// ---------------------------------------------------------------------------
+// Orders (Phase 4). One customer order = one Order; ownership lives on the line
+// (D-009). Three independent status dimensions (D-008). Shopify identity columns
+// per shopify-integration.md §5.2; Shopify code lives in the Shopify session.
+// ---------------------------------------------------------------------------
+
+enum OrderSource {
+  MANUAL
+  CSV_IMPORT
+  SHOPIFY
+  THREEPL_PORTAL
+}
+
+enum OrderStatus {
+  DRAFT
+  NEW
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+enum FulfillmentStatus {
+  UNFULFILLED
+  RESERVED
+  PICKING
+  PACKED
+  PARTIALLY_SHIPPED
+  SHIPPED
+  FULFILLED
+}
+
+/// V3PL → Shopify outbound order state (D-061). PENDING = job queued/running, CREATED = Shopify order id
+/// recorded, FAILED = last attempt failed (the job decides whether it is retryable or needs attention).
+enum ShopifyOutboundStatus {
+  PENDING
+  CREATED
+  FAILED
+}
+
+enum FinancialStatus {
+  NOT_INVOICED
+  INVOICED
+  PAID
+  PARTIALLY_PAID
+  OUTSTANDING
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  /// Internal human number, e.g. "1001", from the Postgres sequence "Order_number_seq".
+  orderNumber String      @unique
+  source      OrderSource
+  /// External reference for imports (CSV "Name", e.g. "#1001"). Unique per source.
+  sourceRef   String?
+
+  // Shopify identity / mirror columns (core-owned, written by the Shopify session via services)
+  shopifyStoreId           String?
+  shopifyOrderId           String?
+  shopifyOrderName         String?
+  shopifyFinancialStatus   String?
+  shopifyFulfillmentStatus String?
+  shopifyUpdatedAt         DateTime?
+  shopifyCancelledAt       DateTime?
+
+  /// Outbound V3PL → Shopify order creation state (D-061); NULL = never requested. Separate from the
+  /// customer-facing statuses; the ORDER_CREATE job carries retry detail.
+  shopifyOutboundStatus ShopifyOutboundStatus?
+  shopifyOutboundError  String?
+
+  status               OrderStatus       @default(NEW)
+  fulfillmentStatus    FulfillmentStatus @default(UNFULFILLED)
+  financialStatus      FinancialStatus   @default(NOT_INVOICED)
+  invoiceReference     String?
+  needsAttention       Boolean           @default(false)
+  needsAttentionReason String?
+
+  currency       String   @default("USD")
+  subtotal       Decimal? @db.Decimal(12, 2)
+  discountTotal  Decimal? @db.Decimal(12, 2)
+  taxTotal       Decimal? @db.Decimal(12, 2)
+  shippingTotal  Decimal? @db.Decimal(12, 2)
+  total          Decimal? @db.Decimal(12, 2)
+  shippingMethod String?
+
+  /// Optional link to the customer directory (D-060). The snapshot fields below are the order's own
+  /// historical record and are never rewritten when the Customer changes; SetNull keeps history if deleted.
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  // Operational customer / ship-to snapshot only (spec §25 — no CRM)
+  customerName  String?
+  customerEmail String?
+  customerPhone String?
+  shipName      String?
+  shipCompany   String?
+  shipAddress1  String?
+  shipAddress2  String?
+  shipCity      String?
+  shipProvince  String?
+  shipZip       String?
+  shipCountry   String?
+  shipPhone     String?
+
+  notes String?
+  tags  String?
+
+  /// Default warehouse for reservation / fulfilment (lines may override).
+  warehouseId        String?
+  warehouse          Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  /// Set when a 3PL client submitted the order from its portal (D-011).
+  submittedByOwnerId String?
+  submittedByOwner   Owner?     @relation("OrderSubmittedByOwner", fields: [submittedByOwnerId], references: [id], onDelete: Restrict)
+  createdById        String?
+  createdBy          User?      @relation("OrderCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  placedAt    DateTime  @default(now())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  items           OrderItem[]
+  fulfillments    Fulfillment[]
+  shipments       Shipment[]
+  returns         Return[]
+  events          OrderEvent[]
+  transactions    InventoryTransaction[]
+  shopifySyncLogs ShopifySyncLog[]
+
+  charges       Charge[]
+  ledgerEntries LedgerEntry[]
+  @@unique([shopifyStoreId, shopifyOrderId])
+  @@unique([source, sourceRef])
+  @@index([status, placedAt])
+  @@index([fulfillmentStatus])
+  @@index([placedAt])
+  @@index([customerEmail])
+  @@index([needsAttention])
+  @@index([submittedByOwnerId])
+  @@index([customerId])
+}
+
+// ---------------------------------------------------------------------------
+// Customer directory (D-060). Operational records only — no logins, no CRM.
+// ownerId NULL = V3PL company customer (admin manual orders); otherwise the vendor /
+// 3PL client the customer belongs to. Portal users only ever see their own owner's rows.
+// ---------------------------------------------------------------------------
+
+enum CustomerSource {
+  MANUAL
+  ORDER
+  THREEPL_PORTAL
+  SHOPIFY
+  CSV_IMPORT
+}
+
+model Customer {
+  id      String  @id @default(cuid())
+  ownerId String?
+  owner   Owner?  @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  name            String
+  /// Stored lower-cased and trimmed. Not unique: the same person can exist under several owners.
+  email           String?
+  phone           String?
+  /// Digits only, for matching (e.g. "+1 (512) 555-0100" → "15125550100").
+  phoneNormalized String?
+
+  shipName     String?
+  shipCompany  String?
+  shipAddress1 String?
+  shipAddress2 String?
+  shipCity     String?
+  shipProvince String?
+  shipZip      String?
+  shipCountry  String?
+  shipPhone    String?
+
+  billName     String?
+  billCompany  String?
+  billAddress1 String?
+  billAddress2 String?
+  billCity     String?
+  billProvince String?
+  billZip      String?
+  billCountry  String?
+
+  notes  String?
+  source CustomerSource @default(MANUAL)
+
+  /// Shopify customer sync (D-060 slot, written since D-065): the store the customer came from and the numeric
+  /// Shopify customer id (same convention as Order.shopifyOrderId). The pair is the sync identity — unique, so
+  /// re-running a sync upserts instead of duplicating.
+  shopifyStoreId    String?
+  shopifyCustomerId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders Order[]
+
+  @@unique([shopifyStoreId, shopifyCustomerId])
+  @@index([ownerId, name])
+  @@index([email])
+  @@index([phoneNormalized])
+}
+
+model OrderItem {
+  id                String         @id @default(cuid())
+  orderId           String
+  order             Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  variantId         String
+  variant           ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  /// Denormalised owner of the SKU at order time (D-009) — the portal isolation key.
+  ownerId           String
+  owner             Owner          @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  position          Int            @default(0)
+  sku               String
+  title             String
+  variantTitle      String?
+  quantity          Int
+  unitPrice         Decimal?       @db.Decimal(12, 2)
+  discount          Decimal?       @db.Decimal(12, 2)
+  tax               Decimal?       @db.Decimal(12, 2)
+  currency          String         @default("USD")
+  requiresShipping  Boolean        @default(true)
+  /// Warehouse the reservation was made in (null while unreserved).
+  warehouseId       String?
+  warehouse         Warehouse?     @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  reservedQty       Int            @default(0)
+  shippedQty        Int            @default(0)
+  returnedQty       Int            @default(0)
+  cancelledQty      Int            @default(0)
+  shopifyLineItemId String?
+  shopifyVariantId  String?
+
+  fulfillmentItems FulfillmentItem[]
+  shipmentItems    ShipmentItem[]
+  returnItems      ReturnItem[]
+  transactions     InventoryTransaction[]
+
+  @@index([orderId])
+  @@index([ownerId])
+  @@index([variantId])
+}
+
+enum FulfillmentRecordStatus {
+  PICKING
+  PACKED
+  SHIPPED
+  CANCELLED
+}
+
+enum FulfillmentType {
+  MANUAL
+  EXTERNAL
+}
+
+/// A unit of warehouse work on part (or all) of an order: pick → pack → ship.
+model Fulfillment {
+  id                   String                  @id @default(cuid())
+  orderId              String
+  order                Order                   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  warehouseId          String
+  warehouse            Warehouse               @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  status               FulfillmentRecordStatus @default(PICKING)
+  type                 FulfillmentType         @default(MANUAL)
+  shopifyStoreId       String?
+  shopifyFulfillmentId String?
+  assignedToId         String?
+  assignedTo           User?                   @relation("FulfillmentAssignedTo", fields: [assignedToId], references: [id], onDelete: Restrict)
+  createdById          String
+  createdBy            User                    @relation("FulfillmentCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  notes                String?
+  createdAt            DateTime                @default(now())
+  packedAt             DateTime?
+  shippedAt            DateTime?
+  cancelledAt          DateTime?
+
+  items    FulfillmentItem[]
+  shipment Shipment?
+
+  @@unique([shopifyStoreId, shopifyFulfillmentId])
+  @@index([orderId])
+  @@index([status, createdAt])
+  @@index([warehouseId, status])
+}
+
+model FulfillmentItem {
+  id            String      @id @default(cuid())
+  fulfillmentId String
+  fulfillment   Fulfillment @relation(fields: [fulfillmentId], references: [id], onDelete: Cascade)
+  orderItemId   String
+  orderItem     OrderItem   @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  quantity      Int
+  /// Pick location (defaults to the location holding the most stock).
+  locationId    String?
+  location      Location?   @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@index([fulfillmentId])
+  @@index([orderItemId])
+}
+
+enum ShipmentStatus {
+  PENDING
+  SHIPPED
+  IN_TRANSIT
+  DELIVERED
+  RETURNED
+}
+
+model Shipment {
+  id              String         @id @default(cuid())
+  orderId         String
+  order           Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  fulfillmentId   String         @unique
+  fulfillment     Fulfillment    @relation(fields: [fulfillmentId], references: [id], onDelete: Restrict)
+  status          ShipmentStatus @default(SHIPPED)
+  carrier         String?
+  service         String?
+  trackingNumber  String?
+  trackingUrl     String?
+  shippedAt       DateTime       @default(now())
+  deliveredAt     DateTime?
+  shopifySyncedAt DateTime?
+  notes           String?
+  createdById     String
+  createdBy       User           @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  items        ShipmentItem[]
+  transactions InventoryTransaction[]
+
+  charges       Charge[]
+  ledgerEntries LedgerEntry[]
+  @@index([orderId])
+  @@index([status, shippedAt])
+  @@index([trackingNumber])
+}
+
+model ShipmentItem {
+  id          String    @id @default(cuid())
+  shipmentId  String
+  shipment    Shipment  @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  orderItemId String
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  quantity    Int
+
+  @@index([shipmentId])
+  @@index([orderItemId])
+}
+
+// ---------------------------------------------------------------------------
+// Returns (spec §15): received → inspected → restock (sellable) or damaged.
+// Nothing becomes available until inspection.
+// ---------------------------------------------------------------------------
+
+enum ReturnStatus {
+  RECEIVED
+  INSPECTED
+}
+
+enum ReturnCondition {
+  SELLABLE
+  DAMAGED
+}
+
+model Return {
+  id            String       @id @default(cuid())
+  orderId       String
+  order         Order        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  warehouseId   String
+  warehouse     Warehouse    @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  status        ReturnStatus @default(RECEIVED)
+  reference     String?
+  reason        String?
+  notes         String?
+  receivedAt    DateTime     @default(now())
+  receivedById  String
+  receivedBy    User         @relation("ReturnReceivedBy", fields: [receivedById], references: [id], onDelete: Restrict)
+  inspectedAt   DateTime?
+  inspectedById String?
+  inspectedBy   User?        @relation("ReturnInspectedBy", fields: [inspectedById], references: [id], onDelete: Restrict)
+
+  items ReturnItem[]
+
+  @@index([orderId])
+  @@index([status, receivedAt])
+}
+
+model ReturnItem {
+  id              String           @id @default(cuid())
+  returnId        String
+  return          Return           @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  orderItemId     String
+  orderItem       OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  variantId       String
+  variant         ProductVariant   @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  ownerId         String
+  owner           Owner            @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  quantity        Int
+  /// Set at inspection.
+  condition       ReturnCondition?
+  locationId      String?
+  location        Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  inspectionNotes String?
+
+  @@index([returnId])
+  @@index([orderItemId])
+}
+
+/// Order history (spec §21 "History"): status changes, reservations, fulfilment,
+/// shipments, returns, imports/syncs, attention flags, notes.
+model OrderEvent {
+  id              String   @id @default(cuid())
+  orderId         String
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  type            String
+  message         String
+  data            Json?
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// External event id (webhook) when the change came from an integration.
+  externalEventId String?
+  createdAt       DateTime @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Import / export jobs (spec §23/§46/§53): preview payload → confirm → results,
+// downloadable failed-row report, history.
+// ---------------------------------------------------------------------------
+
+enum ImportJobType {
+  ORDERS
+  PRODUCTS
+  INVENTORY
+}
+
+enum ImportJobStatus {
+  PREVIEW
+  COMPLETED
+  FAILED
+  DISCARDED
+}
+
+model ImportJob {
+  id             String          @id @default(cuid())
+  type           ImportJobType
+  status         ImportJobStatus @default(PREVIEW)
+  fileName       String
+  detectedFormat String?
+  totalRows      Int             @default(0)
+  totalOrders    Int             @default(0)
+  successCount   Int             @default(0)
+  failedCount    Int             @default(0)
+  duplicateCount Int             @default(0)
+  /// Parsed + validated preview (rows, groups, errors) kept until confirm/discard.
+  payload        Json?
+  /// Import options (default warehouse, reserve, …).
+  options        Json?
+  /// Final results (created order ids, per-row outcome, failed rows).
+  result         Json?
+  createdById    String
+  createdBy      User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime        @default(now())
+  completedAt    DateTime?
+
+  @@index([type, createdAt])
+  @@index([createdById, createdAt])
+}
+
+// ===========================================================================
+// SHOPIFY INTEGRATION (Shopify session, D-027). Design: docs/shopify-integration.md §5.1.
+// These models are written only by src/server/services/shopify/**. Core tables are
+// referenced by id (Order/Fulfillment carry loose shopifyStoreId columns); the FKs
+// below live on Shopify-owned tables only.
+// ===========================================================================
+
+enum ShopifyStoreStatus {
+  PENDING_INSTALL
+  CONNECTED
+  NEEDS_REAUTH
+  UNINSTALLED
+  DISCONNECTED
+}
+
+/// How sellable quantity is computed for a store (D-024). Extensible without a migration to
+/// the rule semantics; new rules are new enum values.
+enum ShopifyPublishRule {
+  ALL_AVAILABLE
+}
+
+/// One connected Shopify store = one sales channel. Never implies an owner (spec: store ≠ vendor).
+model ShopifyStore {
+  id           String             @id @default(cuid())
+  /// Display name chosen by Admin, e.g. "Casabella Store".
+  name         String
+  /// myshopify domain, lower-case, e.g. "casabella.myshopify.com".
+  shopDomain   String             @unique
+  shopGid      String?
+  shopName     String?
+  currencyCode String?
+  timezone     String?
+  status       ShopifyStoreStatus @default(PENDING_INSTALL)
+  apiVersion   String
+
+  /// Scopes granted at install (comma list as returned by Shopify).
+  grantedScopes           String?
+  /// AES-256-GCM (SHOPIFY_TOKEN_ENCRYPTION_KEY). Null unless CONNECTED / NEEDS_REAUTH.
+  encAccessToken          String?
+  encRefreshToken         String?
+  accessTokenExpiresAt    DateTime?
+  refreshTokenExpiresAt   DateTime?
+  installedAt             DateTime?
+  uninstalledAt           DateTime?
+  /// OAuth CSRF nonce while an install/reconnect is in flight.
+  oauthState              String?
+  oauthStateExpiresAt     DateTime?
+  /// Optional per-store app credentials (custom-distribution fallback, D-021). Null = app env credentials.
+  clientIdOverride        String?
+  encClientSecretOverride String?
+
+  ordersImportEnabled Boolean            @default(true)
+  /// Import orders Shopify marks as test (test gateway). Off for live stores.
+  importTestOrders    Boolean            @default(false)
+  /// Orders created before this instant are not imported automatically (set to the connection time).
+  ordersImportSince   DateTime?
+  publishEnabled      Boolean            @default(false)
+  publishRule         ShopifyPublishRule @default(ALL_AVAILABLE)
+  /// Shopify location GID that receives published quantities.
+  publishLocationId   String?
+  publishLocationName String?
+  /// Shopify location GID our fulfilments are created from (usually = publishLocationId).
+  fulfilLocationId    String?
+  fulfilLocationName  String?
+
+  lastOrderCheckpointAt DateTime?
+  lastPublishSweepAt    DateTime?
+  lastCatalogSyncAt     DateTime?
+  /// Start instant of the last COMPLETE customer sync; the next sync only reads customers updated since (D-065).
+  lastCustomerSyncAt    DateTime?
+  lastWebhookAt         DateTime?
+  lastError             String?
+  lastErrorAt           DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  warehouses    ShopifyStoreWarehouse[]
+  mappings      ShopifyVariantMapping[]
+  webhookEvents ShopifyWebhookEvent[]
+  syncLogs      ShopifySyncLog[]
+  outboundJobs  ShopifyOutboundJob[]
+
+  @@index([status])
+}
+
+/// Internal warehouses whose stock feeds this store (publish pool) and that Shopify orders
+/// reserve from. `priority` 0 = default reservation warehouse.
+model ShopifyStoreWarehouse {
+  id          String       @id @default(cuid())
+  storeId     String
+  store       ShopifyStore @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  warehouseId String
+  warehouse   Warehouse    @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  priority    Int          @default(0)
+
+  @@unique([storeId, warehouseId])
+  @@index([warehouseId])
+}
+
+enum ShopifyMappingStatus {
+  MATCHED
+  UNMATCHED
+  CONFLICT
+  IGNORED
+}
+
+enum ShopifyMatchedBy {
+  SKU_EXACT
+  MANUAL
+}
+
+/// Shopify variant (per store) ↔ internal variant. One internal SKU can map to many stores.
+model ShopifyVariantMapping {
+  id                     String               @id @default(cuid())
+  storeId                String
+  store                  ShopifyStore         @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  shopifyProductId       String
+  shopifyVariantId       String
+  shopifyInventoryItemId String?
+  /// Snapshots for display/matching; never used to guess.
+  shopifySku             String?
+  shopifyProductTitle    String?
+  shopifyVariantTitle    String?
+  variantId              String?
+  variant                ProductVariant?      @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  status                 ShopifyMappingStatus @default(UNMATCHED)
+  matchedBy              ShopifyMatchedBy?
+  lastPublishedAvailable Int?
+  lastPublishedAt        DateTime?
+  lastSeenAt             DateTime             @default(now())
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+
+  @@unique([storeId, shopifyVariantId])
+  /// One internal SKU maps to at most one Shopify variant per store (NULLs are distinct in Postgres).
+  @@unique([storeId, variantId])
+  @@index([variantId])
+  @@index([storeId, status])
+  @@index([storeId, shopifySku])
+}
+
+enum ShopifyWebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  SKIPPED_DUPLICATE
+  SKIPPED_STALE
+  IGNORED
+}
+
+/// Every verified webhook delivery, recorded before processing (D-025). `webhookId` is
+/// Shopify's per-delivery id (unique → duplicate deliveries are rejected by the database).
+model ShopifyWebhookEvent {
+  id          String                    @id @default(cuid())
+  storeId     String?
+  store       ShopifyStore?             @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  /// Raw X-Shopify-Shop-Domain header (kept even when the store is unknown).
+  shopDomain  String
+  webhookId   String                    @unique
+  /// X-Shopify-Event-Id: shared by deliveries caused by the same merchant action.
+  eventId     String?
+  topic       String
+  apiVersion  String?
+  triggeredAt DateTime?
+  receivedAt  DateTime                  @default(now())
+  status      ShopifyWebhookEventStatus @default(RECEIVED)
+  attempts    Int                       @default(0)
+  nextRetryAt DateTime?
+  /// Set while PROCESSING; stale locks (> 15 min) are recovered by the retry sweep.
+  lockedAt    DateTime?
+  processedAt DateTime?
+  error       String?
+  payload     Json
+
+  @@index([storeId, receivedAt])
+  @@index([status, nextRetryAt])
+  @@index([topic, receivedAt])
+  @@index([eventId])
+}
+
+enum ShopifySyncDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum ShopifySyncEntity {
+  ORDER
+  FULFILLMENT
+  INVENTORY
+  PRODUCT
+  STORE
+  WEBHOOK
+  CUSTOMER
+}
+
+enum ShopifySyncStatus {
+  SUCCESS
+  FAILED
+  NEEDS_ATTENTION
+  SKIPPED
+}
+
+/// Admin-readable synchronisation history (spec §44).
+model ShopifySyncLog {
+  id             String               @id @default(cuid())
+  storeId        String
+  store          ShopifyStore         @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  direction      ShopifySyncDirection
+  entityType     ShopifySyncEntity
+  externalId     String?
+  internalId     String?
+  operation      String
+  status         ShopifySyncStatus
+  previousValue  String?
+  newValue       String?
+  /// Human-readable summary shown to Admin, e.g. "SKU XVS00099 not found".
+  message        String
+  errorDetail    String?
+  webhookEventId String?
+  orderId        String?
+  order          Order?               @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  retryCount     Int                  @default(0)
+  createdAt      DateTime             @default(now())
+
+  @@index([storeId, createdAt])
+  @@index([status, createdAt])
+  @@index([orderId])
+  @@index([entityType, externalId])
+}
+
+enum ShopifyJobType {
+  FULFILLMENT_CREATE
+  TRACKING_UPDATE
+  INVENTORY_PUBLISH
+  /// V3PL manual order → Shopify order (D-061). Enqueued by core `requestShopifyOrder`; the runner is owned by the Shopify session.
+  ORDER_CREATE
+}
+
+enum ShopifyJobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  NEEDS_ATTENTION
+}
+
+/// Outbound work (platform → Shopify) enqueued inside core transactions via the hooks and
+/// executed afterwards. `dedupeKey` (e.g. "fulfillment:<shipmentId>") guarantees one push
+/// per shipment / one pending publish per store+variant.
+model ShopifyOutboundJob {
+  id          String           @id @default(cuid())
+  storeId     String
+  store       ShopifyStore     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  type        ShopifyJobType
+  targetType  String
+  targetId    String
+  dedupeKey   String           @unique
+  status      ShopifyJobStatus @default(PENDING)
+  attempts    Int              @default(0)
+  nextRetryAt DateTime?
+  lockedAt    DateTime?
+  lastError   String?
+  result      Json?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([storeId, type, status])
+}
+
+// ---------------------------------------------------------------------------
+// Operational charges + owner settlement ledger (NR-8 / NR-9, D-063)
+// ---------------------------------------------------------------------------
+
+enum ChargeType {
+  PICKING
+  PACKING
+  SHIPPING
+  STORAGE
+  FULFILLMENT
+  SERVICE
+  UTILITY
+  OTHER
+}
+
+/// What one rule amount is multiplied by.
+enum ChargeBasis {
+  PER_ORDER
+  PER_SHIPMENT
+  PER_UNIT
+}
+
+/// Admin-configured charge rule. Editing a rule never touches charges already applied (they carry frozen copies).
+model ChargeRule {
+  id         String      @id @default(cuid())
+  name       String
+  chargeType ChargeType
+  basis      ChargeBasis
+  amount     Decimal     @db.Decimal(12, 2)
+  currency   String      @default("USD")
+  active     Boolean     @default(true)
+  /// Applicability: a specific owner, else an owner type, else every owner with charges enabled.
+  ownerId    String?
+  owner      Owner?      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerType  OwnerType?
+  /// Optional weight range (grams) — PER_UNIT: unit weight; PER_SHIPMENT / PER_ORDER: total weight of the owner's units.
+  minWeightGrams Int?
+  maxWeightGrams Int?
+  /// Optional dimension range (cm) on the LONGEST side — PER_UNIT: the unit; PER_SHIPMENT / PER_ORDER: the largest unit.
+  minLongestCm   Decimal? @db.Decimal(8, 2)
+  maxLongestCm   Decimal? @db.Decimal(8, 2)
+  notes       String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  charges Charge[]
+
+  @@index([active, chargeType])
+  @@index([ownerId])
+}
+
+/// One applied operational charge. Immutable: rule name / unit amount are frozen at the time of the event.
+model Charge {
+  id          String      @id @default(cuid())
+  ownerId     String
+  owner       Owner       @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  ruleId      String?
+  rule        ChargeRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  chargeType  ChargeType
+  basis       ChargeBasis
+  ruleName    String
+  quantity    Int
+  unitAmount  Decimal     @db.Decimal(12, 2)
+  amount      Decimal     @db.Decimal(12, 2)
+  currency    String      @default("USD")
+  reason      String
+  orderId     String?
+  order       Order?      @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  shipmentId  String?
+  shipment    Shipment?   @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  orderItemId String?
+  /// Idempotency: one charge per (event, rule[, item, owner]).
+  dedupeKey   String      @unique
+  createdById String?
+  createdAt   DateTime    @default(now())
+
+  ledgerEntry LedgerEntry?
+
+  @@index([ownerId, createdAt])
+  @@index([shipmentId])
+  @@index([orderId])
+}
+
+enum LedgerEntryType {
+  /// 3PL client goods shipped: value owed to the owner for their own product (automatic at shipment, D-064).
+  PRODUCT_VALUE
+  /// Vendor liability created manually by Admin against received inventory (D-064).
+  VENDOR_PAYABLE
+  CHARGE
+  PAYMENT
+  ADJUSTMENT
+}
+
+/// Which obligation an entry belongs to. Payable (V3PL owes the owner) and receivable (the owner owes V3PL) are
+/// tracked and settled independently and are never netted automatically (D-064).
+enum LedgerAccount {
+  PAYABLE
+  RECEIVABLE
+}
+
+enum LedgerEffect {
+  INCREASE
+  DECREASE
+}
+
+/// Immutable settlement-ledger entry (operational, not accounting). Per account: open = Σ INCREASE − Σ DECREASE.
+model LedgerEntry {
+  id          String          @id @default(cuid())
+  ownerId     String
+  owner       Owner           @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  type        LedgerEntryType
+  account     LedgerAccount
+  effect      LedgerEffect
+  amount      Decimal         @db.Decimal(12, 2)
+  currency    String          @default("USD")
+  quantity    Int?
+  /// Historical unit value frozen when the entry was created (PRODUCT_VALUE / VENDOR_PAYABLE).
+  unitAmount  Decimal?        @db.Decimal(12, 2)
+  /// VENDOR_PAYABLE: the received line this payable allocates `quantity` units from (never over-allocated, D-064).
+  receivingItemId String?
+  receivingItem   ReceivingItem? @relation(fields: [receivingItemId], references: [id], onDelete: Restrict)
+  orderId     String?
+  order       Order?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  shipmentId  String?
+  shipment    Shipment?       @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  chargeId    String?         @unique
+  charge      Charge?         @relation(fields: [chargeId], references: [id], onDelete: SetNull)
+  /// Payment reference / document number for PAYMENT and ADJUSTMENT entries.
+  reference   String?
+  description String
+  /// Idempotency: event-derived key or the client-supplied settlement key.
+  dedupeKey   String          @unique
+  occurredAt  DateTime        @default(now())
+  createdById String?
+  createdAt   DateTime        @default(now())
+
+  @@index([ownerId, occurredAt])
+  @@index([ownerId, type])
+  @@index([receivingItemId])
+}
